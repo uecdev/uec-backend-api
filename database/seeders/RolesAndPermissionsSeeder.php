@@ -1,0 +1,32 @@
+<?php
+
+namespace Database\Seeders;
+
+use App\Support\Permissions;
+use Illuminate\Database\Seeder;
+use Spatie\Permission\Models\Permission;
+use Spatie\Permission\Models\Role;
+use Spatie\Permission\PermissionRegistrar;
+
+/** Idempotent: safe to run on every deploy. */
+class RolesAndPermissionsSeeder extends Seeder
+{
+    public function run(): void
+    {
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+
+        foreach (array_keys(Permissions::ALL) as $name) {
+            Permission::findOrCreate($name, 'web');
+        }
+
+        foreach (Permissions::ROLES as $role => $permissions) {
+            $model = Role::findOrCreate($role, 'web');
+            // Only seed defaults for new roles; super admins may have customised existing ones.
+            if ($model->wasRecentlyCreated || $model->permissions()->doesntExist()) {
+                $model->syncPermissions($permissions);
+            }
+        }
+
+        app(PermissionRegistrar::class)->forgetCachedPermissions();
+    }
+}

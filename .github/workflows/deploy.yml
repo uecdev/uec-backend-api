@@ -1,0 +1,86 @@
+name: Deploy
+
+# Independent deployment of the API (api.<domain>) and the admin dashboard (app.<domain>).
+# Staging deploys on every push to main; production deploys on version tags, gated by the
+# "production" GitHub environment (required reviewers recommended). Tests must pass first.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        options: [staging, production]
+        default: staging
+      surface:
+        description: Which surface(s) to deploy
+        type: choice
+        options: [both, api, admin]
+        default: both
+      action:
+        description: Deploy the current ref, or roll back to the previous release
+        type: choice
+        options: [deploy, rollback]
+        default: deploy
+
+jobs:
+  tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.action == 'deploy'
+    uses: ./.github/workflows/ci.yml
+
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.p.outputs.environment }}
+      surfaces: ${{ steps.p.outputs.surfaces }}
+    steps:
+      - id: p
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "environment=${{ inputs.environment }}" >> "$GITHUB_OUTPUT"
+            case "${{ inputs.surface }}" in
+              both) echo 'surfaces=["api","admin"]' >> "$GITHUB_OUTPUT" ;;
+              *) echo "surfaces=[\"${{ inputs.surface }}\"]" >> "$GITHUB_OUTPUT" ;;
+            esac
+          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "environment=production" >> "$GITHUB_OUTPUT"; echo 'surfaces=["api","admin"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "environment=staging" >> "$GITHUB_OUTPUT"; echo 'surfaces=["api","admin"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: [tests, plan]
+    if: always() && needs.plan.result == 'success' && (needs.tests.result == 'success' || needs.tests.result == 'skipped')
+    runs-on: ubuntu-latest
+    environment: ${{ needs.plan.outputs.environment }}
+    strategy:
+      max-parallel: 1          # API first (owns migrations), then admin
+      matrix:
+        surface: ${{ fromJSON(needs.plan.outputs.surfaces) }}
+    concurrency:
+      group: deploy-${{ needs.plan.outputs.environment }}-${{ matrix.surface }}
+      cancel-in-progress: false
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          echo "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+      - name: Run on server
+        env:
+          HOST: ${{ matrix.surface == 'api' && secrets.API_HOST || secrets.ADMIN_HOST }}
+          USER: ${{ secrets.DEPLOY_USER }}
+          REF: ${{ github.ref_name }}
+          ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.action || 'deploy' }}
+        run: |
+          if [ "$ACTION" = "rollback" ]; then
+            ssh "$USER@$HOST" "bash /var/www/uec-${{ matrix.surface }}/current/deploy/rollback.sh ${{ matrix.surface }}"
+          else
+            ssh "$USER@$HOST" "UEC_REPO='${{ secrets.DEPLOY_REPO }}' bash -s" < deploy/deploy.sh -- "${{ matrix.surface }}" "$REF"
+          fi

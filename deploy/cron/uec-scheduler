@@ -1,0 +1,3 @@
+# /etc/cron.d/uec-scheduler — run the Laravel scheduler every minute on the API host.
+# Tasks use onOneServer() (Redis lock), so adding it to more hosts is safe.
+* * * * * www-data cd /var/www/uec-api/current && php artisan schedule:run >> /dev/null 2>&1

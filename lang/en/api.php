@@ -1,0 +1,42 @@
+<?php
+
+return [
+    'unauthenticated' => 'Your session has expired. Please sign in again.',
+    'forbidden' => 'You do not have permission to perform this action.',
+    'not_found' => 'The requested resource was not found.',
+    'method_not_allowed' => 'This method is not supported for this endpoint.',
+    'too_many_requests' => 'Too many requests. Please try again shortly.',
+    'server_error' => 'Something went wrong on our side. Please try again.',
+    'service_unavailable' => 'The service is temporarily unavailable. Please try again shortly.',
+    'payload_too_large' => 'The request is too large.',
+
+    'invalid_credentials' => 'The login details you entered are incorrect.',
+    'account_unverified' => 'Please verify your account. We have sent you a new code.',
+    'account_suspended' => 'This account has been suspended. Please contact UEC support.',
+    'refresh_invalid' => 'Your session has expired. Please sign in again.',
+    'google_invalid' => 'We could not verify your Google sign-in. Please try again.',
+    'google_unavailable' => 'Google sign-in is not available right now.',
+    'login_throttled' => 'Too many login attempts. Please try again in :seconds seconds.',
+
+    'otp_invalid' => 'The code you entered is incorrect.',
+    'otp_expired' => 'This code has expired. Please request a new one.',
+    'otp_locked' => 'Too many incorrect attempts. Please request a new code.',
+    'otp_resend_wait' => 'Please wait :seconds seconds before requesting another code.',
+    'otp_resend_limit' => 'You have requested too many codes. Please start again.',
+    'otp_too_many' => 'Too many verification codes requested. Please try again later.',
+    'reset_expired' => 'This password reset link has expired. Please start again.',
+    'already_registered' => 'An account with these details already exists.',
+    'contact_in_use' => 'This :channel is already in use by another account.',
+    'delete_confirmation' => 'Type DELETE to confirm.',
+
+    'premium_required' => 'This feature requires a UEC Premium subscription.',
+    'already_subscribed' => 'You already have an active subscription. Use change plan instead.',
+    'same_plan' => 'You are already on this plan.',
+    'subscription_not_found' => 'You do not have a subscription.',
+    'subscription_not_active' => 'Your subscription is not active.',
+    'provider_unavailable' => 'This payment provider is not available.',
+    'payment_provider_error' => 'We could not reach the payment provider. Please try again.',
+    'payment_not_found' => 'Payment not found.',
+    'invalid_callback_url' => 'The callback URL is not allowed.',
+    'program_not_found' => 'Program not found.',
+];

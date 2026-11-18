@@ -1,0 +1,1182 @@
+openapi: 3.1.0
+info:
+  title: UEC Mobile API
+  version: 1.0.0
+  summary: REST API for the United Evangelical Church Android and iOS apps.
+  description: |
+    Implements the contract in `docs/backend-handoff.md` (endpoint numbers #1–#52, W1–W3).
+
+    **Conventions**
+    - Base path `/api/v1`, HTTPS only. JSON with **snake_case** keys.
+    - Success bodies are `{ "data": … }`; paginated lists add `meta`.
+    - Errors are `{ "message": string, "code"?: string, "errors"?: { field: [messages] } }`.
+    - Calendar dates are `YYYY-MM-DD`; timestamps ISO-8601 UTC (`2026-01-01T09:00:00Z`).
+    - Money is integer **kobo** with `currency: "NGN"`.
+    - IDs are opaque strings (ULIDs); program IDs are client-generated UUID v4.
+    - `429` responses include `Retry-After` (seconds).
+  contact:
+    name: UEC backend team
+servers:
+  - url: https://api.domainname.org/api/v1
+    description: Production
+  - url: https://api-staging.domainname.org/api/v1
+    description: Staging
+  - url: http://localhost:8000/api/v1
+    description: Local development
+tags:
+  - name: Auth
+  - name: Account
+  - name: Config & pages
+  - name: Hymnal
+  - name: Daily Delight
+  - name: Sunday School
+  - name: Bible
+  - name: Events & branches
+  - name: Sync
+  - name: Subscription
+  - name: Feedback
+  - name: Gateways
+security: []
+
+paths:
+  /auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: "#1 Start sign-up (sends OTP)"
+      description: Creates a pending registration (stored in Redis, not in `users`) and sends a 6-digit OTP — WhatsApp for phone, email via ZeptoMail.
+      parameters: [{ $ref: '#/components/parameters/AcceptLanguage' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [channel, phone, password]
+                  properties:
+                    channel: { const: phone }
+                    phone: { type: string, pattern: '^\+234[789][01]\d{8}$', example: '+2348123456789', description: 'E.164 Nigerian mobile; local formats like 0812… are normalised.' }
+                    password: { $ref: '#/components/schemas/Password' }
+                - type: object
+                  required: [channel, email, password]
+                  properties:
+                    channel: { const: email }
+                    email: { type: string, format: email, maxLength: 191 }
+                    password: { $ref: '#/components/schemas/Password' }
+      responses:
+        '201': { description: Challenge issued, content: { application/json: { schema: { $ref: '#/components/schemas/ChallengeEnvelope' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/register/verify:
+    post:
+      tags: [Auth]
+      operationId: verifyRegistration
+      summary: "#2 Verify OTP → create account + tokens"
+      description: Also completes `ACCOUNT_UNVERIFIED` challenges returned by login.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [verification_id, code]
+              properties:
+                verification_id: { type: string, example: ver_01j9z0x8y5… }
+                code: { type: string, pattern: '^\d{6}$' }
+                device_name: { type: string, maxLength: 100, example: UEC ios app }
+      responses:
+        '201': { description: Account created and signed in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResultEnvelope' } } } }
+        '410': { $ref: '#/components/responses/OtpExpired' }
+        '422': { description: 'Wrong code (`errors.code`)', content: { application/json: { schema: { $ref: '#/components/schemas/ValidationError' } } } }
+        '429': { description: '`OTP_LOCKED` after 5 wrong attempts', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /auth/otp/resend:
+    post:
+      tags: [Auth]
+      operationId: resendOtp
+      summary: "#3 Resend an OTP for any challenge"
+      description: Enforces the 45 s cooldown and invalidates the previous code.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [verification_id], properties: { verification_id: { type: string } } } } }
+      responses:
+        '200':
+          description: New code sent
+          content: { application/json: { schema: { type: object, properties: { data: { type: object, properties: { resend_in: { type: integer, example: 45 }, expires_in: { type: integer, example: 600 } } } } } } }
+        '410': { $ref: '#/components/responses/OtpExpired' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: "#4 Phone/email + password → tokens"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [channel, identifier, password]
+              properties:
+                channel: { type: string, enum: [phone, email] }
+                identifier: { type: string, example: praise@example.com }
+                password: { type: string }
+                device_name: { type: string, maxLength: 100 }
+      responses:
+        '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResultEnvelope' } } } }
+        '403':
+          description: '`ACCOUNT_UNVERIFIED` (with a fresh `verification` challenge) or `ACCOUNT_SUSPENDED`'
+          content: { application/json: { schema: { $ref: '#/components/schemas/UnverifiedError' } } }
+        '422': { description: 'Generic invalid credentials (`errors.identifier`)', content: { application/json: { schema: { $ref: '#/components/schemas/ValidationError' } } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/google:
+    post:
+      tags: [Auth]
+      operationId: googleSignIn
+      summary: "#5 Google ID token → tokens"
+      description: The ID token is verified server-side (signature, audience, issuer, expiry, `email_verified`). Links by Google `sub`, then by verified email, else creates a member.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [id_token], properties: { id_token: { type: string }, device_name: { type: string } } } } }
+      responses:
+        '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResultEnvelope' } } } }
+        '401': { description: Token invalid, content: { application/json: { schema: { $ref: '#/components/schemas/ValidationError' } } } }
+        '403': { description: '`ACCOUNT_SUSPENDED`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '503': { description: '`GOOGLE_UNAVAILABLE`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshTokens
+      summary: "#6 Rotate refresh token → new tokens"
+      description: Every refresh rotates the refresh token. Re-using a rotated token revokes the whole session family (theft detection).
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [refresh_token], properties: { refresh_token: { type: string } } } } }
+      responses:
+        '200': { description: New tokens, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Tokens' } } } } } }
+        '401': { description: '`REFRESH_INVALID` — force logout', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: "#7 Revoke this session"
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { refresh_token: { type: string } } } } }
+      responses:
+        '204': { description: Logged out }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/password/forgot:
+    post:
+      tags: [Auth]
+      operationId: forgotPassword
+      summary: "#8 Start password reset (sends OTP)"
+      description: Always returns 200 with a challenge, even for unknown accounts (no enumeration). No code is sent when there is no account.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [channel, identifier], properties: { channel: { type: string, enum: [phone, email] }, identifier: { type: string } } } } }
+      responses:
+        '200': { description: Challenge, content: { application/json: { schema: { $ref: '#/components/schemas/ChallengeEnvelope' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/verify:
+    post:
+      tags: [Auth]
+      operationId: verifyPasswordReset
+      summary: "#9 Verify OTP → reset token"
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [verification_id, code], properties: { verification_id: { type: string }, code: { type: string } } } } }
+      responses:
+        '200':
+          description: Single-use reset token valid 15 minutes
+          content: { application/json: { schema: { type: object, properties: { data: { type: object, properties: { reset_token: { type: string } } } } } } }
+        '410': { $ref: '#/components/responses/OtpExpired' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /auth/password/reset:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: "#10 Set new password"
+      description: Revokes all of the user's sessions and sends a "password changed" notice.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reset_token, password, password_confirmation]
+              properties:
+                reset_token: { type: string }
+                password: { $ref: '#/components/schemas/Password' }
+                password_confirmation: { type: string }
+      responses:
+        '204': { description: Password changed }
+        '410': { description: '`RESET_EXPIRED`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me:
+    get:
+      tags: [Account]
+      operationId: getMe
+      summary: "#11 Current user"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: User, content: { application/json: { schema: { $ref: '#/components/schemas/UserEnvelope' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [Account]
+      operationId: updateMe
+      summary: "#12 Update name"
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [name], properties: { name: { type: [string, 'null'], maxLength: 80 } } } } }
+      responses:
+        '200': { description: Updated user, content: { application/json: { schema: { $ref: '#/components/schemas/UserEnvelope' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Account]
+      operationId: deleteMe
+      summary: "#16 Delete account"
+      description: Cancels any subscription at the gateway, revokes all tokens, deletes devices/favourites/programs/progress and anonymises the account. Payment records are retained anonymised.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [confirmation], properties: { confirmation: { const: DELETE } } } } }
+      responses:
+        '204': { description: Deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me/avatar:
+    post:
+      tags: [Account]
+      operationId: uploadAvatar
+      summary: "#13 Upload avatar"
+      description: JPEG/PNG/WebP/HEIC ≤ 5 MB, type checked by content. Re-encoded to a 512 px square without EXIF/GPS; served from Cloudinary (or public storage as a fallback).
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: { type: object, required: [avatar], properties: { avatar: { type: string, format: binary } } }
+      responses:
+        '200': { description: Updated user, content: { application/json: { schema: { $ref: '#/components/schemas/UserEnvelope' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me/contact:
+    post:
+      tags: [Account]
+      operationId: changeContact
+      summary: "#14 Add/change email or phone (sends OTP)"
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [channel, value], properties: { channel: { type: string, enum: [phone, email] }, value: { type: string } } } } }
+      responses:
+        '201': { description: Challenge, content: { application/json: { schema: { $ref: '#/components/schemas/ChallengeEnvelope' } } } }
+        '422': { description: Invalid or already in use (`errors.value`), content: { application/json: { schema: { $ref: '#/components/schemas/ValidationError' } } } }
+
+  /me/contact/verify:
+    post:
+      tags: [Account]
+      operationId: verifyContact
+      summary: "#15 Verify contact change"
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [verification_id, code], properties: { verification_id: { type: string }, code: { type: string } } } } }
+      responses:
+        '200': { description: Updated user (sets `*_verified_at`), content: { application/json: { schema: { $ref: '#/components/schemas/UserEnvelope' } } } }
+        '410': { $ref: '#/components/responses/OtpExpired' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /me/devices:
+    post:
+      tags: [Account]
+      operationId: registerDevice
+      summary: "#17 Register FCM token"
+      description: Upsert by token. A token that moves to another account is re-assigned.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token, platform]
+              properties:
+                token: { type: string, maxLength: 512 }
+                platform: { type: string, enum: [ios, android, web] }
+                app_version: { type: string, example: 1.0.0 }
+                locale: { type: string, enum: [en, pcm, ig] }
+      responses:
+        '204': { description: Registered }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me/devices/{token}:
+    delete:
+      tags: [Account]
+      operationId: unregisterDevice
+      summary: "#18 Unregister FCM token"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: token, in: path, required: true, schema: { type: string }, description: URL-encoded FCM token }]
+      responses:
+        '204': { description: Removed (also when already gone) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /app/config:
+    get:
+      tags: [Config & pages]
+      operationId: getAppConfig
+      summary: "#19 Remote config"
+      description: '`payment_providers[0]` is the provider to use for checkout; only configured providers are listed.'
+      responses:
+        '200': { description: Config, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/AppConfig' } } } } } }
+
+  /pages/{slug}:
+    get:
+      tags: [Config & pages]
+      operationId: getPage
+      summary: "#20 About / anthem / doctrine (and terms / privacy)"
+      parameters: [{ name: slug, in: path, required: true, schema: { type: string, enum: [about, anthem, doctrine, terms, privacy] } }]
+      responses:
+        '200': { description: Page (Cache-Control max-age=3600), content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Page' } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /hymns:
+    get:
+      tags: [Hymnal]
+      operationId: listHymns
+      summary: "#21 Full hymn catalogue"
+      description: One unpaginated response, cached 1 h. Send `If-None-Match` with the previous `ETag` to receive `304`.
+      parameters: [{ name: If-None-Match, in: header, schema: { type: string } }]
+      responses:
+        '200':
+          description: Catalogue
+          headers: { ETag: { schema: { type: string } } }
+          content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/HymnCatalogue' } } } } }
+        '304': { description: Not modified }
+
+  /hymns/{id}:
+    get:
+      tags: [Hymnal]
+      operationId: getHymn
+      summary: "#22 Hymn detail"
+      description: |
+        Bearer token optional. Server-side entitlement enforcement: `audio` contains short-lived (15 min) signed URLs only for users with `hymn.audio`, otherwise `[]`; `solfa` is returned only with `hymn.solfa`, otherwise `null`. `has_audio` / `has_solfa` always describe what exists so the app can show the paywall.
+      security: [{}, { bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Hymn, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/HymnDetail' } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /devotionals/editions:
+    get:
+      tags: [Daily Delight]
+      operationId: listEditions
+      summary: "#23 Devotional editions"
+      responses:
+        '200': { description: Editions, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Edition' } } } } } } }
+
+  /devotionals/editions/{year}/entries:
+    get:
+      tags: [Daily Delight]
+      operationId: listEntries
+      summary: "#24 Entry summaries (whole year or one month)"
+      description: Entries dated after today (Africa/Lagos) are hidden unless UEC enables future visibility. Premium (archive) editions need `archive.editions`.
+      security: [{}, { bearerAuth: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/Year' }
+        - { name: month, in: query, schema: { type: integer, minimum: 1, maximum: 12 } }
+      responses:
+        '200': { description: Summaries, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/EntrySummary' } } } } } } }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /devotionals/entries/{date}:
+    get:
+      tags: [Daily Delight]
+      operationId: getEntry
+      summary: "#25 Full entry"
+      security: [{}, { bearerAuth: [] }]
+      parameters: [{ name: date, in: path, required: true, schema: { type: string, format: date } }]
+      responses:
+        '200': { description: Entry, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Entry' } } } } } }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { description: No reading for this day, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /devotionals/editions/{year}/download:
+    get:
+      tags: [Daily Delight]
+      operationId: downloadEdition
+      summary: "#26 Full edition bundle (premium)"
+      description: Requires a token and the `offline.downloads` entitlement. Served gzip-compressed by the web server.
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Year' }]
+      responses:
+        '200': { description: Bundle, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/EditionBundle' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /me/devotional-progress:
+    get:
+      tags: [Sync]
+      operationId: getProgress
+      summary: "#27 Read dates"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: year, in: query, required: true, schema: { type: integer } }]
+      responses:
+        '200':
+          description: Dates marked read
+          content: { application/json: { schema: { type: object, properties: { data: { type: object, properties: { read_dates: { type: array, items: { type: string, format: date } } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/devotional-progress/{date}:
+    put:
+      tags: [Sync]
+      operationId: markRead
+      summary: "#28 Mark read (idempotent)"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: date, in: path, required: true, schema: { type: string, format: date } }]
+      responses:
+        '204': { description: Recorded }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /sunday-school/manuals:
+    get:
+      tags: [Sunday School]
+      operationId: listManuals
+      summary: "#29 Manuals"
+      responses:
+        '200': { description: Manuals, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Manual' } } } } } } }
+
+  /sunday-school/manuals/{year}:
+    get:
+      tags: [Sunday School]
+      operationId: getManual
+      summary: "#30 Lessons + weekly plan"
+      security: [{}, { bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Year' }]
+      responses:
+        '200': { description: Manual, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/ManualDetail' } } } } } }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sunday-school/lessons/{id}:
+    get:
+      tags: [Sunday School]
+      operationId: getLesson
+      summary: "#31 Full lesson"
+      security: [{}, { bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Lesson, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Lesson' } } } } } }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sunday-school/manuals/{year}/download:
+    get:
+      tags: [Sunday School]
+      operationId: downloadManual
+      summary: "#32 Full manual bundle (premium)"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ $ref: '#/components/parameters/Year' }]
+      responses:
+        '200': { description: Bundle, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/ManualBundle' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PremiumRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sunday-school/search:
+    get:
+      tags: [Sunday School]
+      operationId: searchLessons
+      summary: "#33 Lesson search across years"
+      description: Matches title, passage and "lesson N". Up to 50 results, best match first.
+      parameters: [{ name: q, in: query, required: true, schema: { type: string, maxLength: 100 } }]
+      responses:
+        '200': { description: Lesson summaries, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/LessonSummary' } } } } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /bible/versions:
+    get:
+      tags: [Bible]
+      operationId: listBibleVersions
+      summary: "#34 Available versions"
+      responses:
+        '200': { description: Versions, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/BibleVersion' } } } } } } }
+
+  /bible/{version}/chapters/{book}/{chapter}:
+    get:
+      tags: [Bible]
+      operationId: getBibleChapter
+      summary: "#35 Chapter verses"
+      description: Book ids are USFM codes (GEN … REV). Cache-Control max-age=604800.
+      parameters:
+        - { name: version, in: path, required: true, schema: { type: string, example: KJV } }
+        - { name: book, in: path, required: true, schema: { type: string, example: JOS } }
+        - { name: chapter, in: path, required: true, schema: { type: integer, minimum: 1 } }
+      responses:
+        '200': { description: Chapter, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/BibleChapter' } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /events:
+    get:
+      tags: [Events & branches]
+      operationId: listEvents
+      summary: "#36 Events that start in a year"
+      parameters: [{ name: year, in: query, schema: { type: integer }, description: Defaults to the current year }]
+      responses:
+        '200': { description: Events, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Event' } } } } } } }
+
+  /events/{id}:
+    get:
+      tags: [Events & branches]
+      operationId: getEvent
+      summary: "#37 Event detail"
+      parameters: [{ $ref: '#/components/parameters/Id' }]
+      responses:
+        '200': { description: Event, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Event' } } } } } }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /branches:
+    get:
+      tags: [Events & branches]
+      operationId: listBranches
+      summary: "#38 Paginated branch search"
+      description: Searches name, address, city and state; alphabetical.
+      parameters:
+        - { name: q, in: query, schema: { type: string } }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: per_page, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 30 } }
+      responses:
+        '200':
+          description: Page of branches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data: { type: array, items: { $ref: '#/components/schemas/Branch' } }
+                  meta: { $ref: '#/components/schemas/PaginationMeta' }
+
+  /search:
+    get:
+      tags: [Events & branches]
+      operationId: globalSearch
+      summary: "#39 Global search"
+      description: Up to 10 results per group; devotionals from the current edition only.
+      parameters: [{ name: q, in: query, required: true, schema: { type: string, maxLength: 100 } }]
+      responses:
+        '200': { description: Results, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/SearchResults' } } } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me/favourites:
+    get:
+      tags: [Sync]
+      operationId: getFavourites
+      summary: "#40 Favourite hymns & lessons"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Favourites, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Favourites' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    put:
+      tags: [Sync]
+      operationId: replaceFavourites
+      summary: "#41 Replace favourites (idempotent)"
+      description: Full replacement, ≤ 2,000 ids each. Unknown ids are dropped (not rejected) so a stale client can still sync.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/Favourites' } } }
+      responses:
+        '204': { description: Saved }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+
+  /me/programs:
+    get:
+      tags: [Sync]
+      operationId: listPrograms
+      summary: "#42 Hymn programs"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Programs, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Program' } } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/programs/{id}:
+    put:
+      tags: [Sync]
+      operationId: upsertProgram
+      summary: "#43 Upsert program (idempotent)"
+      description: Last write wins on `updated_at`; an older write returns 204 without changing the stored copy.
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid }, description: Client-generated UUID v4 }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/ProgramInput' } } }
+      responses:
+        '201': { description: Created }
+        '204': { description: Updated (or stale write ignored) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: The id belongs to another user, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+    delete:
+      tags: [Sync]
+      operationId: deleteProgram
+      summary: "#44 Delete program"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+      responses:
+        '204': { description: Deleted (also when already gone) }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /subscription/plans:
+    get:
+      tags: [Subscription]
+      operationId: listPlans
+      summary: "#45 Plans"
+      responses:
+        '200': { description: Active plans, content: { application/json: { schema: { type: object, properties: { data: { type: array, items: { $ref: '#/components/schemas/Plan' } } } } } } }
+
+  /me/subscription:
+    get:
+      tags: [Subscription]
+      operationId: getSubscription
+      summary: "#46 Subscription + entitlements"
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: State, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/SubscriptionState' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /me/subscription/checkout:
+    post:
+      tags: [Subscription]
+      operationId: checkout
+      summary: "#47 Initialise payment"
+      description: The amount always comes from the plan in the database. Open `authorization_url` in an in-app browser; the gateway returns to `/payments/callback`, which redirects to `callback_url`.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_id, provider]
+              properties:
+                plan_id: { type: string, example: plan_yearly }
+                provider: { type: string, enum: [paystack, monnify] }
+                callback_url: { type: string, default: 'uecapp://payment/callback', description: 'Only the app scheme or an approved https host' }
+      responses:
+        '200': { description: Checkout session, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Checkout' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { description: '`ALREADY_SUBSCRIBED`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '502': { description: '`PAYMENT_PROVIDER_ERROR`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /me/subscription/verify:
+    post:
+      tags: [Subscription]
+      operationId: verifyPayment
+      summary: "#48 Verify payment by reference"
+      description: Idempotent; poll up to ~6 times over ~15 s while `pending`. Falls back to the gateway's verify API when the webhook has not arrived.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [reference], properties: { reference: { type: string } } } } }
+      responses:
+        '200': { description: Status, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/VerifyResult' } } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { description: Unknown reference or another user's, content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /me/subscription/change-preview:
+    get:
+      tags: [Subscription]
+      operationId: previewPlanChange
+      summary: "#49 Preview plan change"
+      security: [{ bearerAuth: [] }]
+      parameters: [{ name: plan_id, in: query, required: true, schema: { type: string } }]
+      responses:
+        '200': { description: Preview, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/ChangePreview' } } } } } }
+        '404': { description: '`SUBSCRIPTION_NOT_FOUND`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: '`SAME_PLAN` or `SUBSCRIPTION_NOT_ACTIVE`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /me/subscription/change:
+    post:
+      tags: [Subscription]
+      operationId: changePlan
+      summary: "#50 Schedule plan change"
+      description: The new plan starts on the next billing date (no proration). Changing plan while cancelled re-activates auto-renew.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, required: [plan_id], properties: { plan_id: { type: string } } } } }
+      responses:
+        '200': { description: Subscription with `pending_plan`, content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Subscription' } } } } } }
+        '404': { description: '`SUBSCRIPTION_NOT_FOUND`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: '`SAME_PLAN` or `SUBSCRIPTION_NOT_ACTIVE`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /me/subscription/cancel:
+    post:
+      tags: [Subscription]
+      operationId: cancelSubscription
+      summary: "#51 Cancel at period end"
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        content: { application/json: { schema: { type: object, properties: { reason: { type: [string, 'null'], maxLength: 500 } } } } }
+      responses:
+        '200': { description: Cancelled subscription (`access_until` = period end), content: { application/json: { schema: { type: object, properties: { data: { $ref: '#/components/schemas/Subscription' } } } } } }
+        '404': { description: '`SUBSCRIPTION_NOT_FOUND`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+        '409': { description: '`SUBSCRIPTION_NOT_ACTIVE`', content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } } }
+
+  /feedback:
+    post:
+      tags: [Feedback]
+      operationId: submitFeedback
+      summary: "#52 Submit feedback (guests allowed)"
+      security: [{}, { bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [type, message]
+              properties:
+                type: { type: string, maxLength: 40, pattern: '^[A-Za-z0-9_-]+$', example: suggestion }
+                message: { type: string, minLength: 3, maxLength: 5000 }
+                contact_consent: { type: boolean }
+                'attachments[]': { type: array, maxItems: 4, items: { type: string, format: binary }, description: 'JPEG/PNG/WebP/HEIC/PDF, ≤ 5 MB each' }
+      responses:
+        '201':
+          description: Received
+          content: { application/json: { schema: { type: object, properties: { data: { type: object, properties: { id: { type: string }, status: { const: received } } } } } } }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /webhooks/paystack:
+    post:
+      tags: [Gateways]
+      operationId: paystackWebhook
+      summary: W1 Paystack events
+      description: Verified with `x-paystack-signature` = HMAC-SHA512(raw body, secret key). De-duplicated, then processed on the `webhooks` queue. Handles charge.success, subscription.create, subscription.disable, subscription.not_renew, invoice.payment_failed, refund.processed.
+      security: [{ paystackSignature: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: 'Queued or duplicate', content: { application/json: { schema: { type: object, properties: { status: { type: string, enum: [queued, duplicate] } } } } } }
+        '401': { description: Invalid signature }
+
+  /webhooks/monnify:
+    post:
+      tags: [Gateways]
+      operationId: monnifyWebhook
+      summary: W2 Monnify events
+      description: Verified with `monnify-signature` = HMAC-SHA512(raw body, client secret). Handles SUCCESSFUL_TRANSACTION, FAILED_TRANSACTION, REFUND_COMPLETED.
+      security: [{ monnifySignature: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object } } } }
+      responses:
+        '200': { description: Queued or duplicate }
+        '401': { description: Invalid signature }
+
+  /payments/callback:
+    get:
+      tags: [Gateways]
+      operationId: paymentCallback
+      summary: W3 Browser landing page → app
+      description: Redirects to the app's callback URL (`uecapp://payment/callback?reference=…`) with an HTML fallback link. Query parameters are only used to build the redirect.
+      parameters:
+        - { name: reference, in: query, schema: { type: string } }
+        - { name: trxref, in: query, schema: { type: string } }
+        - { name: paymentReference, in: query, schema: { type: string } }
+      responses:
+        '302': { description: Redirect to the app }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Access token from login/refresh (expires after 15 minutes).
+    paystackSignature: { type: apiKey, in: header, name: x-paystack-signature }
+    monnifySignature: { type: apiKey, in: header, name: monnify-signature }
+
+  parameters:
+    AcceptLanguage: { name: Accept-Language, in: header, schema: { type: string, enum: [en, pcm, ig] }, description: Language for server-generated messages }
+    Id: { name: id, in: path, required: true, schema: { type: string } }
+    Year: { name: year, in: path, required: true, schema: { type: integer, example: 2026 } }
+
+  responses:
+    Unauthorized:
+      description: '`UNAUTHENTICATED` — refresh the token once, then re-login'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, example: { message: Your session has expired. Please sign in again., code: UNAUTHENTICATED } } }
+    PremiumRequired:
+      description: '`PREMIUM_REQUIRED` — open the paywall'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, example: { message: This feature requires a UEC Premium subscription., code: PREMIUM_REQUIRED } } }
+    NotFound:
+      description: Not found
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' }, example: { message: The requested resource was not found., code: NOT_FOUND } } }
+    ValidationFailed:
+      description: Validation errors (Laravel `errors` bag)
+      content: { application/json: { schema: { $ref: '#/components/schemas/ValidationError' } } }
+    OtpExpired:
+      description: '`OTP_EXPIRED` — request a new code'
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+    TooManyRequests:
+      description: 'Rate limited (`RATE_LIMITED`, `OTP_LOCKED`, `TOO_MANY_ATTEMPTS`, `OTP_RESEND_TOO_SOON`)'
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/json: { schema: { $ref: '#/components/schemas/Error' } } }
+
+  schemas:
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+        code: { type: string, example: PREMIUM_REQUIRED }
+    ValidationError:
+      type: object
+      required: [message, errors]
+      properties:
+        message: { type: string }
+        code: { type: string }
+        errors: { type: object, additionalProperties: { type: array, items: { type: string } }, example: { email: [An account with these details already exists.] } }
+    UnverifiedError:
+      allOf:
+        - $ref: '#/components/schemas/Error'
+        - type: object
+          properties:
+            verification: { $ref: '#/components/schemas/Challenge' }
+    Password: { type: string, minLength: 8, maxLength: 128, description: 'At least 8 characters with letters and numbers; breached passwords are rejected.' }
+    Challenge:
+      type: object
+      required: [verification_id, channel, destination_masked, expires_in, resend_in]
+      properties:
+        verification_id: { type: string }
+        channel: { type: string, enum: [phone, email] }
+        destination_masked: { type: string, example: '+234 ••• ••• 6789' }
+        expires_in: { type: integer, example: 600 }
+        resend_in: { type: integer, example: 45 }
+    ChallengeEnvelope: { type: object, properties: { data: { $ref: '#/components/schemas/Challenge' } } }
+    Tokens:
+      type: object
+      required: [access_token, refresh_token, expires_in, token_type]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, example: 900 }
+        token_type: { const: Bearer }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: [string, 'null'] }
+        phone: { type: [string, 'null'], example: '+2348123456789' }
+        email: { type: [string, 'null'] }
+        phone_verified_at: { type: [string, 'null'], format: date-time }
+        email_verified_at: { type: [string, 'null'], format: date-time }
+        avatar_url: { type: [string, 'null'] }
+        is_premium: { type: boolean }
+        roles: { type: array, items: { type: string }, example: [member] }
+        created_at: { type: string, format: date-time }
+    UserEnvelope: { type: object, properties: { data: { $ref: '#/components/schemas/User' } } }
+    AuthResultEnvelope:
+      type: object
+      properties:
+        data:
+          type: object
+          properties:
+            user: { $ref: '#/components/schemas/User' }
+            tokens: { $ref: '#/components/schemas/Tokens' }
+    AppConfig:
+      type: object
+      properties:
+        donation_url: { type: [string, 'null'] }
+        min_supported_version: { type: string, example: 1.0.0 }
+        latest_version: { type: string, example: 1.2.0 }
+        store_urls: { type: object, properties: { android: { type: [string, 'null'] }, ios: { type: [string, 'null'] } } }
+        payment_providers: { type: array, items: { type: string, enum: [paystack, monnify] } }
+        support_email: { type: [string, 'null'] }
+        maintenance_message: { type: [string, 'null'], description: 'Additive: optional notice' }
+        update_message: { type: [string, 'null'], description: 'Additive: optional announcement' }
+    Page:
+      type: object
+      properties:
+        slug: { type: string }
+        title: { type: string }
+        body: { type: string, description: Restricted markup (handoff §C.2) }
+        updated_at: { type: string, format: date-time }
+    HymnCategory: { type: object, properties: { slug: { type: string }, name: { type: string } } }
+    HymnSummary:
+      type: object
+      properties:
+        id: { type: string }
+        number: { type: integer }
+        title: { type: string }
+        first_line: { type: string }
+        categories: { type: array, items: { type: string } }
+        has_audio: { type: boolean }
+        has_solfa: { type: boolean }
+    HymnCatalogue:
+      type: object
+      properties:
+        version: { type: string, format: date-time }
+        categories: { type: array, items: { $ref: '#/components/schemas/HymnCategory' } }
+        hymns: { type: array, items: { $ref: '#/components/schemas/HymnSummary' } }
+    Stanza:
+      type: object
+      properties:
+        type: { type: string, enum: [verse, chorus, refrain, bridge] }
+        number: { type: [integer, 'null'] }
+        lines: { type: array, items: { type: string } }
+    SolfaText:
+      type: object
+      properties:
+        format: { const: text }
+        key: { type: [string, 'null'] }
+        time_signature: { type: [string, 'null'] }
+        sections: { type: array, items: { type: object, properties: { label: { type: string }, lines: { type: array, items: { type: string } } } } }
+    SolfaImage:
+      type: object
+      properties:
+        format: { const: image }
+        image_url: { type: string }
+        width: { type: [integer, 'null'] }
+        height: { type: [integer, 'null'] }
+    AudioTrack:
+      type: object
+      properties:
+        id: { type: string }
+        label: { type: string }
+        url: { type: string, description: Signed URL valid ~15 minutes }
+        duration_seconds: { type: integer }
+        size_bytes: { type: integer }
+    HymnDetail:
+      allOf:
+        - $ref: '#/components/schemas/HymnSummary'
+        - type: object
+          properties:
+            stanzas: { type: array, items: { $ref: '#/components/schemas/Stanza' } }
+            solfa: { oneOf: [{ $ref: '#/components/schemas/SolfaText' }, { $ref: '#/components/schemas/SolfaImage' }, { type: 'null' }] }
+            audio: { type: array, items: { $ref: '#/components/schemas/AudioTrack' } }
+            author: { type: [string, 'null'] }
+            composer: { type: [string, 'null'] }
+            tune: { type: [string, 'null'] }
+            meter: { type: [string, 'null'] }
+            key: { type: [string, 'null'] }
+            tempo: { type: [string, 'null'] }
+            about: { type: [string, 'null'] }
+            scripture_refs: { type: array, items: { type: string } }
+            tags: { type: array, items: { type: string } }
+            updated_at: { type: string, format: date-time }
+    Edition:
+      type: object
+      properties:
+        year: { type: integer }
+        title: { type: string }
+        theme: { type: [string, 'null'] }
+        entry_count: { type: integer }
+        size_bytes: { type: integer }
+        published_at: { type: [string, 'null'], format: date-time }
+        is_premium: { type: boolean }
+    EntrySummary: { type: object, properties: { date: { type: string, format: date }, title: { type: string }, passage: { type: string } } }
+    MemoryVerse: { type: object, properties: { text: { type: string }, reference: { type: string } } }
+    Entry:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        edition_year: { type: integer }
+        title: { type: string }
+        passage: { type: string }
+        memory_verse: { $ref: '#/components/schemas/MemoryVerse' }
+        body: { type: string }
+        declaration: { type: [string, 'null'] }
+        prayer: { type: [string, 'null'] }
+    EditionBundle:
+      type: object
+      properties:
+        edition: { $ref: '#/components/schemas/Edition' }
+        entries: { type: array, items: { $ref: '#/components/schemas/Entry' } }
+    Manual:
+      type: object
+      properties:
+        year: { type: integer }
+        title: { type: string }
+        theme: { type: [string, 'null'] }
+        lesson_count: { type: integer }
+        size_bytes: { type: integer }
+        published_at: { type: [string, 'null'], format: date-time }
+        is_premium: { type: boolean }
+    LessonSummary:
+      type: object
+      properties:
+        id: { type: string }
+        manual_year: { type: integer }
+        number: { type: integer }
+        title: { type: string }
+        passage: { type: string }
+    Lesson:
+      allOf:
+        - $ref: '#/components/schemas/LessonSummary'
+        - type: object
+          properties:
+            memory_verse: { $ref: '#/components/schemas/MemoryVerse' }
+            aim: { type: string }
+            introduction: { type: string }
+            outline: { type: array, items: { type: object, properties: { heading: { type: string }, body: { type: string } } } }
+            applications: { type: array, items: { type: string } }
+            conclusion: { type: string }
+            revision_questions: { type: array, items: { type: string } }
+    PlanWeek:
+      type: object
+      properties:
+        date: { type: string, format: date, description: A Sunday }
+        week: { type: integer, minimum: 1, maximum: 5 }
+        lesson_id: { type: [string, 'null'] }
+        lesson_number: { type: [integer, 'null'] }
+        description: { type: string }
+    ManualDetail:
+      type: object
+      properties:
+        manual: { $ref: '#/components/schemas/Manual' }
+        lessons: { type: array, items: { $ref: '#/components/schemas/LessonSummary' } }
+        plan: { type: array, items: { $ref: '#/components/schemas/PlanWeek' } }
+    ManualBundle:
+      type: object
+      properties:
+        manual: { $ref: '#/components/schemas/Manual' }
+        lessons: { type: array, items: { $ref: '#/components/schemas/Lesson' } }
+        plan: { type: array, items: { $ref: '#/components/schemas/PlanWeek' } }
+    BibleVersion: { type: object, properties: { id: { type: string }, name: { type: string }, abbreviation: { type: string } } }
+    BibleChapter:
+      type: object
+      properties:
+        version: { type: string }
+        book_id: { type: string }
+        chapter: { type: integer }
+        verses: { type: array, items: { type: object, properties: { number: { type: integer }, text: { type: string } } } }
+    Event:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        start_date: { type: string, format: date }
+        end_date: { type: [string, 'null'], format: date }
+        start_time: { type: [string, 'null'], example: '09:00', description: Africa/Lagos; null = all day }
+        description: { type: string }
+        location: { type: [string, 'null'] }
+        category: { type: [string, 'null'] }
+        share_url: { type: [string, 'null'] }
+    Branch:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        address: { type: string }
+        city: { type: [string, 'null'] }
+        state: { type: [string, 'null'] }
+        phone: { type: [string, 'null'] }
+        latitude: { type: [number, 'null'] }
+        longitude: { type: [number, 'null'] }
+    PaginationMeta:
+      type: object
+      properties:
+        current_page: { type: integer }
+        last_page: { type: integer }
+        per_page: { type: integer }
+        total: { type: integer }
+    SearchResults:
+      type: object
+      properties:
+        hymns: { type: array, items: { $ref: '#/components/schemas/HymnSummary' } }
+        devotionals: { type: array, items: { $ref: '#/components/schemas/EntrySummary' } }
+        lessons: { type: array, items: { $ref: '#/components/schemas/LessonSummary' } }
+        events: { type: array, items: { $ref: '#/components/schemas/Event' } }
+    Favourites:
+      type: object
+      required: [hymn_ids, lesson_ids]
+      properties:
+        hymn_ids: { type: array, maxItems: 2000, items: { type: string } }
+        lesson_ids: { type: array, maxItems: 2000, items: { type: string } }
+    ProgramInput:
+      type: object
+      required: [name, hymn_ids]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, maxLength: 80 }
+        date: { type: [string, 'null'], format: date }
+        hymn_ids: { type: array, maxItems: 100, items: { type: string }, description: Existing hymn ids, order preserved }
+        updated_at: { type: string, format: date-time }
+    Program:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        date: { type: [string, 'null'], format: date }
+        hymn_ids: { type: array, items: { type: string } }
+        updated_at: { type: string, format: date-time }
+    Plan:
+      type: object
+      properties:
+        id: { type: string, example: plan_yearly }
+        name: { type: string }
+        interval: { type: string, enum: [month, six_months, year] }
+        amount: { type: integer, description: Kobo, example: 1990000 }
+        currency: { const: NGN }
+        savings_percent: { type: [integer, 'null'] }
+        highlighted: { type: boolean }
+    Subscription:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [active, cancelled, past_due, expired] }
+        plan: { $ref: '#/components/schemas/Plan' }
+        started_at: { type: string, format: date-time }
+        current_period_end: { type: string, format: date-time }
+        next_billing_date: { type: [string, 'null'], format: date-time }
+        cancelled_at: { type: [string, 'null'], format: date-time }
+        access_until: { type: [string, 'null'], format: date-time }
+        payment_method: { oneOf: [{ type: object, properties: { type: { const: card }, label: { type: string, example: 'Visa •••• 4081' } } }, { type: 'null' }] }
+        pending_plan: { oneOf: [{ $ref: '#/components/schemas/Plan' }, { type: 'null' }] }
+        pending_plan_effective_at: { type: [string, 'null'], format: date-time }
+    SubscriptionState:
+      type: object
+      properties:
+        subscription: { oneOf: [{ $ref: '#/components/schemas/Subscription' }, { type: 'null' }] }
+        entitlements: { type: array, items: { type: string, enum: [hymn.audio, hymn.solfa, offline.downloads, archive.editions] } }
+    Checkout:
+      type: object
+      properties:
+        reference: { type: string, example: uec_pay_01j9… }
+        provider: { type: string, enum: [paystack, monnify] }
+        authorization_url: { type: string }
+        expires_at: { type: [string, 'null'], format: date-time }
+    VerifyResult:
+      type: object
+      properties:
+        status: { type: string, enum: [success, pending, failed, abandoned] }
+        subscription: { oneOf: [{ $ref: '#/components/schemas/Subscription' }, { type: 'null' }] }
+    ChangePreview:
+      type: object
+      properties:
+        plan: { $ref: '#/components/schemas/Plan' }
+        current_plan: { $ref: '#/components/schemas/Plan' }
+        effective_date: { type: string, format: date }
+        amount: { type: integer, description: Kobo charged on the effective date }
